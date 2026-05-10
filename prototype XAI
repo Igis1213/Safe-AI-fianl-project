@@ -1,0 +1,76 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import shap
+from datetime import datetime, timedelta
+
+# 1. 야후 파이낸스 데이터 로드 (yfinance 활용)
+# 별도의 API 키 없이 S&P 500 ETF(SPY)의 최근 5년 데이터를 불러옵니다.
+print("야후 파이낸스에서 데이터를 다운로드하는 중입니다...")
+end_date = datetime.now()
+start_date = end_date - timedelta(days=5*365)
+df = yf.download('SPY', start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
+
+# yfinance 최신 버전의 멀티인덱스 컬럼을 단일 인덱스로 평탄화
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = df.columns.get_level_values(0)
+
+# 2. 퀀트 팩터(Feature) 생성
+# 종가(Close)를 기준으로 일간 수익률, 모멘텀, 변동성 팩터를 생성합니다.
+# 이전 코드는 df를 반복해서 덮어썼으므로, 새로운 컬럼으로 추가합니다.
+df['Daily_Return'] = df['Close'].pct_change()
+df['Momentum_20'] = df['Close'].pct_change(periods=20) # 20일 단기 모멘텀
+df['Momentum_60'] = df['Close'].pct_change(periods=60) # 60일 중기 모멘텀
+df['Volatility_20'] = df['Close'].rolling(window=20).std() # 20일 변동성 (종가 기준)
+
+# 타겟 변수 생성 (향후 5일 뒤 주가가 현재가보다 상승하면 1, 하락하면 0)
+df['Target'] = (df['Close'].shift(-5) / df['Close'] - 1 > 0).astype(int)
+
+# 특성(X) 및 타겟(y) 분리
+features = ['Daily_Return', 'Momentum_20', 'Momentum_60', 'Volatility_20']
+
+# 지표 계산으로 인해 발생한 결측치 제거
+df = df.dropna(subset=features + ['Target']) # 모든 필요한 컬럼에서 결측치 제거
+
+X = df[features]
+y = df['Target'] # y를 'Target' 컬럼으로 정확히 지정
+
+# 3. 백테스팅을 위한 시계열 데이터 분할 (Train/Test Split)
+# 미래 데이터를 미리 학습하는 오류를 막기 위해 시간순으로 80%는 학습, 최근 20%는 검증(백테스트)으로 사용합니다.
+split_index = int(len(df) * 0.8)
+X_train, X_test = X.iloc[:split_index], X.iloc[split_index:]
+y_train, y_test = y.iloc[:split_index], y.iloc[split_index:]
+
+print(f"학습 데이터 기간: {X_train.index.min().date()} ~ {X_train.index.max().date()}")
+print(f"백테스트 데이터 기간: {X_test.index.min().date()} ~ {X_test.index.max().date()}")
+
+# 4. LightGBM 모델 학습
+print("\nLightGBM 모델 학습 중...")
+model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42)
+model.fit(X_train, y_train)
+
+# 백테스트 구간에 대한 예측 및 정확도 평가
+predictions = model.predict(X_test)
+accuracy = np.mean(predictions == y_test)
+print(f"백테스트 구간 방향성 예측 정확도: {accuracy * 100:.2f}%\n")
+
+# 5. SHAP을 활용한 설명가능성(XAI) 추출
+explainer = shap.TreeExplainer(model)
+
+# 백테스트 기간 중 가장 최근 시점(마지막 거래일)의 데이터를 가져와 포지션 진입 근거 분석
+sample_data = X_test.iloc[[-1]]
+shap_values = explainer.shap_values(sample_data)
+
+# LightGBM의 반환 형태에 따라 상승(클래스 1)에 대한 기여도를 추출
+if isinstance(shap_values, list):
+    shap_vals_target = shap_values[1] # For multi-class classification, get values for class 1
+else:
+    # For binary classification, shap_values might be a 2D array (1, n_features) for the positive class
+    # or a 3D array (1, n_features, n_classes) for specific cases
+    shap_vals_target = shap_values[0] if shap_values.ndim == 2 else shap_values[0, :, 1] 
+
+print(f"=== [{sample_data.index[0].date()}] 상승 예측에 대한 팩터 기여도 (SHAP Values) ===")
+for feature, shap_val in zip(sample_data.columns, shap_vals_target):
+    direction = "상승 방향으로 기여" if shap_val > 0 else "하락 방향으로 기여"
+    print(f"- {feature} (실제수치: {sample_data[feature].iloc[0]:.4f}): {shap_val:+.4f} ({direction})")
